@@ -1,2 +1,4 @@
 feral cats dataset
-processed_dataset
+processed_dataset*
+cat_dataset_parquet
+*.pt
