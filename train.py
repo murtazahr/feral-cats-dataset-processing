@@ -1,8 +1,11 @@
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.backends.cudnn as cudnn
+import torch.cuda.amp as amp
 from datasets import load_dataset
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
@@ -11,6 +14,8 @@ import time
 import datetime
 import logging
 from dotenv import load_dotenv
+from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
+import seaborn as sns
 
 from networks.wide_restnet import Wide_ResNet
 
@@ -75,14 +80,27 @@ def main():
     logger = logging.getLogger(__name__)
 
     # Dataset parameters
-    batch_size = 64
-    num_epochs = 50
-    learning_rate = 0.1
+    batch_size = 32  # Increased batch size for GPU
+    num_epochs = 25
+    learning_rate = 0.01
     num_workers = 4
     dropout_rate = 0.3
     depth = 28
     widen_factor = 10
     log_interval = 10  # Log every 10 batches
+
+    # GPU optimization parameters
+    use_amp = True  # Use Automatic Mixed Precision
+    pin_memory = True  # Pin memory for faster GPU transfer
+    cudnn_benchmark = True  # Enable cudnn benchmark for optimized performance
+    prefetch_factor = 2  # Prefetch batches (only works with num_workers > 0)
+
+    # Set GPU optimization flags
+    if cudnn_benchmark and torch.cuda.is_available():
+        cudnn.benchmark = True  # Set cudnn to benchmark mode for optimized performance
+        logger.info("cuDNN benchmark enabled")
+    else:
+        logger.info("cuDNN benchmark disabled")
 
     # Load environment variables from .env file
     load_dotenv()
@@ -103,6 +121,9 @@ def main():
     logger.info(f"  Dropout rate: {dropout_rate}")
     logger.info(f"  Model depth: {depth}")
     logger.info(f"  Model widen factor: {widen_factor}")
+    logger.info(f"  AMP (mixed precision): {use_amp}")
+    logger.info(f"  Pin memory: {pin_memory}")
+    logger.info(f"  Data loader workers: {num_workers}")
 
     # Load dataset from Hugging Face
     logger.info("Loading dataset from Hugging Face...")
@@ -127,9 +148,27 @@ def main():
     train_dataset = FeralCatsDataset(dataset['train'], transform=transform_train)
     test_dataset = FeralCatsDataset(dataset['test'], transform=transform_test)
 
-    # Create data loaders
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    # Create data loaders with optimized settings for GPU
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=pin_memory,  # Faster CPU to GPU transfers
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,  # Prefetch batches
+        persistent_workers=num_workers > 0,  # Keep workers alive between epochs
+        drop_last=True  # Drop last incomplete batch for better GPU utilization
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size * 2,  # Can use larger batch size for evaluation
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
+        persistent_workers=num_workers > 0
+    )
 
     # Print dataset statistics
     num_classes = len(train_dataset.get_class_names())
@@ -141,19 +180,57 @@ def main():
     # Set up device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     logger.info(f"Using device: {device}")
+
+    # Log GPU information and optimize settings
     if device.type == 'cuda':
+        # Log GPU details
         logger.info(f"  CUDA device: {torch.cuda.get_device_name(0)}")
         logger.info(f"  CUDA memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.2f} GB")
+        logger.info(f"  CUDA capability: {torch.cuda.get_device_capability(0)}")
+
+        # Optimize memory allocations
+        torch.cuda.empty_cache()
+
+        # Run a warmup to initialize CUDA context (reduces timing noise in first batches)
+        logger.info("Running CUDA warmup...")
+        dummy_input = torch.zeros(1, 3, 32, 32, device=device)
+        dummy_model = nn.Conv2d(3, 3, 3).to(device)
+        for _ in range(3):  # A few warmup iterations
+            _ = dummy_model(dummy_input)
+        torch.cuda.synchronize()
+        logger.info("CUDA warmup completed")
 
     # Initialize model
     logger.info(f"Initializing Wide ResNet-{depth}-{widen_factor} model...")
     model = Wide_ResNet(depth, widen_factor, dropout_rate, num_classes).to(device)
-    logger.info(f"Number of model parameters: {sum(p.numel() for p in model.parameters())/1e6:.2f}M")
 
-    # Loss and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=learning_rate, momentum=0.9, weight_decay=5e-4, nesterov=True)
+    # Log model parameters
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"Number of model parameters: {total_params/1e6:.2f}M (trainable: {trainable_params/1e6:.2f}M)")
+
+    # Use multiple GPUs if available
+    if torch.cuda.device_count() > 1:
+        logger.info(f"Using {torch.cuda.device_count()} GPUs for data parallel training")
+        model = nn.DataParallel(model)
+
+    # Loss and optimizer with optimized settings
+    criterion = nn.CrossEntropyLoss().to(device)  # Move loss function to GPU
+    optimizer = optim.SGD(
+        model.parameters(),
+        lr=learning_rate,
+        momentum=0.9,
+        weight_decay=5e-4,
+        nesterov=True
+    )
     scheduler = optim.lr_scheduler.MultiStepLR(optimizer, milestones=[30, 40], gamma=0.2)
+
+    # Initialize mixed precision training if available and selected
+    scaler = amp.GradScaler(enabled=use_amp and device.type == 'cuda')
+    if use_amp and device.type == 'cuda':
+        logger.info("Using automatic mixed precision (FP16) training")
+    else:
+        logger.info("Using full precision (FP32) training")
 
     # Training metrics tracking
     train_losses = []
@@ -184,24 +261,36 @@ def main():
         # Initialize batch timing
         batch_start = time.time()
 
+        # Move these outside the batch loop for better performance
+        optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+
         for batch_idx, (images, labels) in enumerate(train_loader):
-            # Move data to device
-            images, labels = images.to(device), labels.to(device)
+            # Move data to device (asynchronously if pin_memory=True)
+            images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
 
-            # Forward pass
-            optimizer.zero_grad()
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            # Mixed precision forward pass
+            with amp.autocast(enabled=use_amp and device.type == 'cuda'):
+                outputs = model(images)
+                loss = criterion(outputs, labels)
 
-            # Backward pass
-            loss.backward()
-            optimizer.step()
+            # Mixed precision backward pass
+            scaler.scale(loss).backward()
+
+            # Optimizer step with gradient scaling for mixed precision
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+
+            # Ensure all asynchronous CUDA operations are done before moving on
+            if device.type == 'cuda' and batch_idx % 10 == 0:
+                torch.cuda.synchronize()
 
             # Update metrics
             running_loss += loss.item() * images.size(0)
-            _, predicted = outputs.max(1)
-            total += labels.size(0)
-            correct += predicted.eq(labels).sum().item()
+            with torch.no_grad():  # Save memory during inference
+                _, predicted = outputs.max(1)
+                total += labels.size(0)
+                correct += predicted.eq(labels).sum().item()
 
             # Calculate batch processing time
             batch_end = time.time()
@@ -218,6 +307,14 @@ def main():
                 avg_batch_time = sum(batch_times[-log_interval:]) / min(log_interval, len(batch_times[-log_interval:]))
                 images_per_sec = batch_size / avg_batch_time
 
+                # Get GPU memory usage
+                if device.type == 'cuda':
+                    gpu_memory_allocated = torch.cuda.memory_allocated() / 1e9
+                    gpu_memory_reserved = torch.cuda.memory_reserved() / 1e9
+                    memory_info = f"GPU Mem: {gpu_memory_allocated:.2f}/{gpu_memory_reserved:.2f} GB"
+                else:
+                    memory_info = ""
+
                 logger.info(
                     f"Epoch [{epoch+1}/{num_epochs}] "
                     f"Batch [{batch_idx+1}/{len(train_loader)}] "
@@ -227,6 +324,7 @@ def main():
                     f"LR: {optimizer.param_groups[0]['lr']:.6f} "
                     f"Time: {batch_time:.3f}s "
                     f"Img/s: {images_per_sec:.1f} "
+                    f"{memory_info} "
                     f"ETA: {datetime.timedelta(seconds=int(avg_batch_time * (len(train_loader) - batch_idx - 1)))}"
                 )
 
@@ -265,9 +363,11 @@ def main():
         class_total = [0] * num_classes
 
         logger.info("Starting validation...")
-        with torch.no_grad():
+        with torch.no_grad(), amp.autocast(enabled=use_amp and device.type == 'cuda'):
             for images, labels in test_loader:
-                images, labels = images.to(device), labels.to(device)
+                images, labels = images.to(device, non_blocking=True), labels.to(device, non_blocking=True)
+
+                # Forward pass with mixed precision
                 outputs = model(images)
                 loss = criterion(outputs, labels)
 
@@ -282,6 +382,10 @@ def main():
                     class_total[label] += 1
                     if predicted[i].item() == label:
                         class_correct[label] += 1
+
+        # Synchronize GPU operations before measuring time
+        if device.type == 'cuda':
+            torch.cuda.synchronize()
 
         # Calculate validation metrics
         val_epoch_loss = val_loss / val_total
@@ -323,12 +427,20 @@ def main():
         logger.info("-" * 80)
 
     # Save final model
-    torch.save(model.state_dict(), 'final_feral_cats_model.pth')
+    if isinstance(model, nn.DataParallel):
+        # Save the model state without DataParallel wrapper
+        torch.save(model.module.state_dict(), 'final_feral_cats_model.pth')
+    else:
+        torch.save(model.state_dict(), 'final_feral_cats_model.pth')
 
     # Calculate final training time
     total_training_time = time.time() - start_training_time
     hours, remainder = divmod(total_training_time, 3600)
     minutes, seconds = divmod(remainder, 60)
+
+    # Clean up GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # Log final results
     logger.info("=" * 80)
@@ -339,10 +451,36 @@ def main():
     logger.info(f"Total training time: {int(hours)}h {int(minutes)}m {seconds:.2f}s")
     logger.info(f"Average epoch time: {sum(epoch_times)/len(epoch_times):.2f}s")
     logger.info(f"Average batch time: {sum(batch_times)/len(batch_times):.4f}s")
+
+    # GPU memory statistics if available
+    if torch.cuda.is_available():
+        peak_memory = torch.cuda.max_memory_allocated() / 1e9
+        logger.info(f"Peak GPU memory usage: {peak_memory:.2f} GB")
+
     logger.info("=" * 80)
 
     # Plot training history
     plot_training_history(train_losses, val_losses, train_accs, val_accs, num_epochs)
+
+    # Load the best model for evaluation
+    logger.info("Loading best model for detailed evaluation...")
+    if isinstance(model, nn.DataParallel):
+        best_model = Wide_ResNet(depth, widen_factor, dropout_rate, num_classes).to(device)
+        best_model.load_state_dict(torch.load('best_feral_cats_model.pth'))
+        if torch.cuda.device_count() > 1:
+            best_model = nn.DataParallel(best_model)
+    else:
+        best_model = model
+        best_model.load_state_dict(torch.load('best_feral_cats_model.pth'))
+
+    # Calculate detailed metrics
+    detailed_metrics = calculate_detailed_metrics(best_model, test_loader, device, num_classes)
+
+    # Log all metrics
+    log_detailed_metrics(detailed_metrics, train_dataset.get_class_names(), logger)
+
+    # Plot confusion matrix and per-class metrics
+    plot_confusion_matrix(detailed_metrics, train_dataset.get_class_names())
 
 
 def plot_training_history(train_losses, val_losses, train_accs, val_accs, num_epochs):
@@ -402,6 +540,200 @@ def visualize_sample(dataset, idx):
     plt.title(f"Class: {class_name} (Label: {label})")
     plt.axis('off')
     plt.show()
+
+def calculate_detailed_metrics(model, test_loader, device, num_classes):
+    """
+    Calculate detailed metrics after training is complete
+
+    Returns:
+        Dictionary containing all metrics and confusion matrix
+    """
+    model.eval()
+
+    # Initialize storage for predictions and targets
+    all_targets = []
+    all_predictions = []
+    all_scores = []  # For storing raw prediction scores (for top-k accuracy)
+
+    # Disable gradient calculation for inference
+    with torch.no_grad():
+        for images, targets in test_loader:
+            images, targets = images.to(device, non_blocking=True), targets.to(device, non_blocking=True)
+
+            # Forward pass
+            outputs = model(images)
+
+            # Get predictions
+            _, predictions = outputs.max(1)
+
+            # Store raw scores for top-k accuracy calculation
+            all_scores.append(outputs.cpu())
+
+            # Store targets and predictions
+            all_targets.extend(targets.cpu().numpy())
+            all_predictions.extend(predictions.cpu().numpy())
+
+    # Convert lists to numpy arrays
+    all_targets = np.array(all_targets)
+    all_predictions = np.array(all_predictions)
+    all_scores = torch.cat(all_scores, dim=0).numpy()
+
+    # Calculate metrics
+    metrics = {}
+
+    # Overall accuracy
+    metrics['accuracy'] = (all_targets == all_predictions).mean() * 100
+
+    # Top-5 accuracy (if num_classes >= 5)
+    if num_classes >= 5:
+        top5_count = 0
+        for i in range(len(all_targets)):
+            # Get indices of top 5 predictions for this sample
+            top5_indices = np.argsort(all_scores[i])[-5:]
+            if all_targets[i] in top5_indices:
+                top5_count += 1
+        metrics['top5_accuracy'] = (top5_count / len(all_targets)) * 100
+    else:
+        metrics['top5_accuracy'] = 'N/A (less than 5 classes)'
+
+    # Per-class and micro/macro/weighted metrics
+    metrics['per_class_precision'] = precision_score(all_targets, all_predictions,
+                                                     average=None,
+                                                     zero_division=0)
+    metrics['per_class_recall'] = recall_score(all_targets, all_predictions,
+                                               average=None,
+                                               zero_division=0)
+    metrics['per_class_f1'] = f1_score(all_targets, all_predictions,
+                                       average=None,
+                                       zero_division=0)
+
+    # Micro average (calculate metrics globally by counting total TP, FN and FP)
+    metrics['micro_precision'] = precision_score(all_targets, all_predictions,
+                                                 average='micro',
+                                                 zero_division=0)
+    metrics['micro_recall'] = recall_score(all_targets, all_predictions,
+                                           average='micro',
+                                           zero_division=0)
+    metrics['micro_f1'] = f1_score(all_targets, all_predictions,
+                                   average='micro',
+                                   zero_division=0)
+
+    # Macro average (calculate metrics for each class and take unweighted mean)
+    metrics['macro_precision'] = precision_score(all_targets, all_predictions,
+                                                 average='macro',
+                                                 zero_division=0)
+    metrics['macro_recall'] = recall_score(all_targets, all_predictions,
+                                           average='macro',
+                                           zero_division=0)
+    metrics['macro_f1'] = f1_score(all_targets, all_predictions,
+                                   average='macro',
+                                   zero_division=0)
+
+    # Weighted average (calculate metrics for each class and take mean weighted by support)
+    metrics['weighted_precision'] = precision_score(all_targets, all_predictions,
+                                                    average='weighted',
+                                                    zero_division=0)
+    metrics['weighted_recall'] = recall_score(all_targets, all_predictions,
+                                              average='weighted',
+                                              zero_division=0)
+    metrics['weighted_f1'] = f1_score(all_targets, all_predictions,
+                                      average='weighted',
+                                      zero_division=0)
+
+    # Generate confusion matrix
+    metrics['confusion_matrix'] = confusion_matrix(all_targets, all_predictions)
+
+    return metrics
+
+
+def log_detailed_metrics(metrics, class_names, logger):
+    """
+    Log detailed metrics to console and file via logger
+    """
+    logger.info("=" * 80)
+    logger.info("DETAILED EVALUATION METRICS")
+    logger.info("=" * 80)
+
+    # Log top-1 and top-5 accuracy
+    logger.info(f"Top-1 Accuracy: {metrics['accuracy']:.2f}%")
+    if isinstance(metrics['top5_accuracy'], str):
+        logger.info(f"Top-5 Accuracy: {metrics['top5_accuracy']}")
+    else:
+        logger.info(f"Top-5 Accuracy: {metrics['top5_accuracy']:.2f}%")
+
+    # Log micro/macro/weighted averages
+    logger.info("\nAggregated Metrics:")
+    logger.info(f"  Micro-average Precision: {metrics['micro_precision']:.4f}")
+    logger.info(f"  Micro-average Recall: {metrics['micro_recall']:.4f}")
+    logger.info(f"  Micro-average F1: {metrics['micro_f1']:.4f}")
+    logger.info(f"  Macro-average Precision: {metrics['macro_precision']:.4f}")
+    logger.info(f"  Macro-average Recall: {metrics['macro_recall']:.4f}")
+    logger.info(f"  Macro-average F1: {metrics['macro_f1']:.4f}")
+    logger.info(f"  Weighted-average Precision: {metrics['weighted_precision']:.4f}")
+    logger.info(f"  Weighted-average Recall: {metrics['weighted_recall']:.4f}")
+    logger.info(f"  Weighted-average F1: {metrics['weighted_f1']:.4f}")
+
+    # Log per-class metrics
+    logger.info("\nPer-class Metrics:")
+    for i, class_name in enumerate(class_names):
+        logger.info(f"  Class {i} ({class_name}):")
+        logger.info(f"    Precision: {metrics['per_class_precision'][i]:.4f}")
+        logger.info(f"    Recall: {metrics['per_class_recall'][i]:.4f}")
+        logger.info(f"    F1-score: {metrics['per_class_f1'][i]:.4f}")
+
+    logger.info("=" * 80)
+
+
+def plot_confusion_matrix(metrics, class_names):
+    """
+    Plot and save confusion matrix
+    """
+    plt.figure(figsize=(10, 8))
+    conf_matrix = metrics['confusion_matrix']
+
+    # Create dataframe for better visualization
+    df_cm = pd.DataFrame(conf_matrix, index=class_names, columns=class_names)
+
+    # Get percentage of examples in each class for normalization
+    row_sums = conf_matrix.sum(axis=1)
+    normalized_cm = conf_matrix / row_sums[:, np.newaxis]
+    df_cm_norm = pd.DataFrame(normalized_cm, index=class_names, columns=class_names)
+
+    # Plot normalized confusion matrix
+    sns.heatmap(df_cm_norm, annot=True, cmap="Blues", fmt='.2f', cbar=True, vmin=0, vmax=1)
+    plt.ylabel('True Label')
+    plt.xlabel('Predicted Label')
+    plt.title('Normalized Confusion Matrix')
+    plt.tight_layout()
+
+    # Create directory for plots if it doesn't exist
+    if not os.path.exists('plots'):
+        os.makedirs('plots')
+
+    plt.savefig('plots/confusion_matrix.png')
+    logging.info("Confusion matrix saved to 'plots/confusion_matrix.png'")
+
+    # Create more detailed metrics plot
+    plt.figure(figsize=(15, 10))
+
+    # Prepare metrics for plotting
+    class_metrics = pd.DataFrame({
+        'Precision': metrics['per_class_precision'],
+        'Recall': metrics['per_class_recall'],
+        'F1-Score': metrics['per_class_f1']
+    }, index=class_names)
+
+    # Plot per-class metrics
+    ax = class_metrics.plot(kind='bar', figsize=(15, 7))
+    plt.title('Precision, Recall and F1-Score per Class')
+    plt.ylabel('Score')
+    plt.xlabel('Class')
+    plt.ylim([0, 1])
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+
+    plt.savefig('plots/per_class_metrics.png')
+    logging.info("Per-class metrics plot saved to 'plots/per_class_metrics.png'")
 
 
 if __name__ == "__main__":
