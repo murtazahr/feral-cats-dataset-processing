@@ -89,6 +89,10 @@ def main():
     widen_factor = 10
     log_interval = 10  # Log every 10 batches
 
+    # NEW: Control per-class logging frequency
+    per_class_eval_epochs = [0, num_epochs-1]  # Only compute per-class metrics at start and end
+    # Alternatively: per_class_eval_epochs = [i for i in range(0, num_epochs, 5)]  # Every 5 epochs
+
     # GPU optimization parameters
     use_amp = True  # Use Automatic Mixed Precision
     pin_memory = True  # Pin memory for faster GPU transfer
@@ -124,6 +128,7 @@ def main():
     logger.info(f"  AMP (mixed precision): {use_amp}")
     logger.info(f"  Pin memory: {pin_memory}")
     logger.info(f"  Data loader workers: {num_workers}")
+    logger.info(f"  Per-class evaluation epochs: {per_class_eval_epochs}")
 
     # Load dataset from Hugging Face
     logger.info("Loading dataset from Hugging Face...")
@@ -359,8 +364,17 @@ def main():
         val_correct = 0
         val_total = 0
         val_start = time.time()
-        class_correct = [0] * num_classes
-        class_total = [0] * num_classes
+
+        # We only track per-class metrics during specific epochs to save time
+        do_per_class_eval = epoch in per_class_eval_epochs
+
+        # Only initialize these if we're doing per-class evaluation this epoch
+        if do_per_class_eval:
+            class_correct = [0] * num_classes
+            class_total = [0] * num_classes
+            # For detailed metrics, we'll collect predictions and targets
+            all_targets = []
+            all_predictions = []
 
         logger.info("Starting validation...")
         with torch.no_grad(), amp.autocast(enabled=use_amp and device.type == 'cuda'):
@@ -376,12 +390,18 @@ def main():
                 val_total += labels.size(0)
                 val_correct += predicted.eq(labels).sum().item()
 
-                # Per-class accuracy
-                for i in range(labels.size(0)):
-                    label = labels[i].item()
-                    class_total[label] += 1
-                    if predicted[i].item() == label:
-                        class_correct[label] += 1
+                # Per-class accuracy - only if we're doing per-class evaluation this epoch
+                if do_per_class_eval:
+                    # Collect for detailed metrics
+                    all_targets.extend(labels.cpu().numpy())
+                    all_predictions.extend(predicted.cpu().numpy())
+
+                    # Also do per-class tracking
+                    for i in range(labels.size(0)):
+                        label = labels[i].item()
+                        class_total[label] += 1
+                        if predicted[i].item() == label:
+                            class_correct[label] += 1
 
         # Synchronize GPU operations before measuring time
         if device.type == 'cuda':
@@ -404,12 +424,29 @@ def main():
             f"Time: {val_time:.2f}s"
         )
 
-        # Log per-class accuracy
-        for i in range(num_classes):
-            if class_total[i] > 0:
-                class_acc = 100. * class_correct[i] / class_total[i]
-                class_name = train_dataset.get_class_names()[i]
-                logger.info(f"  Class {i} ({class_name}): {class_acc:.2f}% ({class_correct[i]}/{class_total[i]})")
+        # Log per-class accuracy - only if we're doing per-class evaluation this epoch
+        if do_per_class_eval:
+            logger.info("Per-class accuracy:")
+            for i in range(num_classes):
+                if class_total[i] > 0:
+                    class_acc = 100. * class_correct[i] / class_total[i]
+                    class_name = train_dataset.get_class_names()[i]
+                    logger.info(f"  Class {i} ({class_name}): {class_acc:.2f}% ({class_correct[i]}/{class_total[i]})")
+
+            # If this is the final epoch, calculate additional metrics
+            if epoch == num_epochs - 1:
+                # Convert to numpy arrays for sklearn metrics
+                all_targets = np.array(all_targets)
+                all_predictions = np.array(all_predictions)
+
+                # Calculate and log precision, recall, F1
+                precision = precision_score(all_targets, all_predictions, average='macro', zero_division=0)
+                recall = recall_score(all_targets, all_predictions, average='macro', zero_division=0)
+                f1 = f1_score(all_targets, all_predictions, average='macro', zero_division=0)
+
+                logger.info(f"Macro precision: {precision:.4f}")
+                logger.info(f"Macro recall: {recall:.4f}")
+                logger.info(f"Macro F1 score: {f1:.4f}")
 
         # Save model if it's the best so far
         if val_accuracy > best_acc:
@@ -550,6 +587,10 @@ def calculate_detailed_metrics(model, test_loader, device, num_classes):
     """
     model.eval()
 
+    logger = logging.getLogger(__name__)
+    logger.info("Calculating detailed metrics...")
+    start_time = time.time()
+
     # Initialize storage for predictions and targets
     all_targets = []
     all_predictions = []
@@ -642,6 +683,8 @@ def calculate_detailed_metrics(model, test_loader, device, num_classes):
 
     # Generate confusion matrix
     metrics['confusion_matrix'] = confusion_matrix(all_targets, all_predictions)
+
+    logger.info(f"Detailed metrics calculation completed in {time.time() - start_time:.2f} seconds")
 
     return metrics
 
