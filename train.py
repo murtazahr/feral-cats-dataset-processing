@@ -90,7 +90,7 @@ def main():
     log_interval = 10  # Log every 10 batches
 
     # NEW: Control per-class logging frequency
-    per_class_eval_epochs = [0, num_epochs-1]  # Only compute per-class metrics at start and end
+    per_class_eval_epochs = [num_epochs-1]  # Only compute per-class metrics at start and end
     # Alternatively: per_class_eval_epochs = [i for i in range(0, num_epochs, 5)]  # Every 5 epochs
 
     # GPU optimization parameters
