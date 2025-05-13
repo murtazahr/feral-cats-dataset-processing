@@ -12,4 +12,7 @@ torch~=2.7.0
 torchvision~=0.22.0
 pandas~=2.2.3
 ultralytics~=8.3.131
+matplotlib~=3.10.3
+datasets~=3.6.0
 pyarrow~=20.0.0
+python-dotenv~=1.1.0
